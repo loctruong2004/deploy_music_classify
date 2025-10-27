@@ -2,192 +2,160 @@
 import os
 import gradio as gr
 from http.cookies import SimpleCookie
-from typing import List, Tuple
 
-from auth_db import verify_jwt
 from ui_navbar import add_navbar
-from music_db import init_music_db, list_genres, list_tracks_by_genre, search_tracks
+# Nếu bạn dùng đăng nhập bằng cookie:
+from auth_db import verify_jwt
 
-# Khởi tạo DB nhạc (có seed demo nếu thiếu)
-init_music_db(seed_demo=True)
+from db_tracks_mssql import fetch_genres, fetch_tracks_by_genre, fetch_all_tracks
 
 def _read_token_from_cookie(request: gr.Request):
     raw = request.headers.get("cookie", "") if request and hasattr(request, "headers") and request.headers else ""
     c = SimpleCookie()
-    try:
-        c.load(raw)
-    except Exception:
-        return None
+    try: c.load(raw)
+    except: return None
     return c.get("access_token").value if "access_token" in c else None
 
-def _filter_existing_files(rows: List[Tuple[int, str, str, str, str, int]]):
+def _rows_to_playlist(rows):
     """
-    Lọc những track có file tồn tại thật sự trên đĩa,
-    tránh trường hợp DB có mà file thiếu.
+    rows: [{id,title,artist,genre,filepath,duration_sec}, ...]
+    -> names: "id • title • artist", path: filepath
+    chỉ giữ file tồn tại thật sự
     """
     out = []
     for r in rows:
-        _, title, artist, genre, path, duration = r
-        if path and os.path.exists(path):
-            out.append(r)
+        p = r.get("filepath") or ""
+        if p and os.path.exists(p):
+            display = f"{r['id']} • {r['title'] or os.path.basename(p)}" + (f" • {r['artist']}" if r.get("artist") else "")
+            out.append((display, p))
     return out
 
-def _to_table(rows: List[Tuple[int, str, str, str, str, int]]):
-    """
-    Convert rows -> dữ liệu bảng hiển thị
-    """
-    data = []
-    for (tid, title, artist, genre, path, dur) in rows:
-        mins = (dur or 0) // 60
-        secs = (dur or 0) % 60
-        data.append([tid, title, artist or "", genre, f"{mins:02d}:{secs:02d}", path])
-    return data
-
-def load_genres_and_tracks():
-    genres = list_genres()
+# ----- Events -----
+def load_initial():
+    # genres + all tracks
+    genres = fetch_genres()
     genres = ["Tất cả"] + genres if genres else ["Tất cả"]
-    rows = _filter_existing_files(list_tracks_by_genre(None))
-    table = _to_table(rows)
-    # default lựa chọn track đầu tiên nếu có
-    first_src = rows[0][4] if rows else None
-    first_title = rows[0][1] if rows else None
-    return gr.update(choices=genres, value=genres[0]), table, first_title, first_src
+    rows = fetch_all_tracks(100)
+    playlist = _rows_to_playlist(rows)
+    names = [n for (n, _) in playlist]
+    first_name, first_src = (playlist[0] if playlist else (None, None))
+    return gr.update(choices=genres, value=genres[0]), gr.update(choices=names, value=first_name), first_src, f"✅ Nạp {len(playlist)} bài từ DB."
 
 def on_change_genre(genre):
-    rows = _filter_existing_files(list_tracks_by_genre(genre))
-    table = _to_table(rows)
-    first_src = rows[0][4] if rows else None
-    first_title = rows[0][1] if rows else None
-    return table, first_title, first_src
+    rows = fetch_tracks_by_genre(genre, 200)
+    playlist = _rows_to_playlist(rows)
+    names = [n for (n, _) in playlist]
+    first_name, first_src = (playlist[0] if playlist else (None, None))
+    return gr.update(choices=names, value=first_name), first_src
 
-def on_search(q, cur_genre):
-    rows = _filter_existing_files(search_tracks(q, cur_genre))
-    table = _to_table(rows)
-    first_src = rows[0][4] if rows else None
-    first_title = rows[0][1] if rows else None
-    return table, first_title, first_src
+def on_refresh(genre):
+    return on_change_genre(genre)
 
-def on_select_row(evt: gr.SelectData, current_table):
-    """
-    Khi người dùng click 1 dòng trong Dataframe, evt.index trả về (row_idx, col_idx)
-    Ta lấy path ở cột cuối cùng (index -1).
-    """
-    if not current_table:
-        return None, None
-    row_idx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
-    if row_idx is None or row_idx >= len(current_table):
-        return None, None
-    row = current_table[row_idx]
-    title = row[1]       # cột Title
-    path  = row[-1]      # cột Filepath (ẩn trong UI)
-    return title, path
+def on_select_song(name, genre):
+    rows = fetch_tracks_by_genre(genre, 200)
+    playlist = _rows_to_playlist(rows)
+    for n, p in playlist:
+        if n == name:
+            return p
+    return None
 
-def next_prev(current_title, current_table, direction="next"):
-    if not current_table:
+def next_prev(current_name, genre, direction="next"):
+    rows = fetch_tracks_by_genre(genre, 200)
+    playlist = _rows_to_playlist(rows)
+    if not playlist:
         return None, None
-    titles = [r[1] for r in current_table]
-    paths  = [r[-1] for r in current_table]
-    if not titles:
-        return None, None
+    names = [n for (n, _) in playlist]
+    paths = [p for (_, p) in playlist]
     try:
-        idx = titles.index(current_title) if current_title in titles else -1
+        idx = names.index(current_name) if current_name in names else -1
     except ValueError:
         idx = -1
     if idx < 0:
         idx = 0
     else:
-        if direction == "next":
-            idx = (idx + 1) % len(titles)
-        else:
-            idx = (idx - 1) % len(titles)
-    return titles[idx], paths[idx]
+        idx = (idx + 1) % len(names) if direction == "next" else (idx - 1) % len(names)
+    return names[idx], paths[idx]
 
 def build_player_ui():
-    with gr.Blocks(title="🎵 Music Player") as demo:
-        # Navbar
+    with gr.Blocks(title="🎵 Music Player (SQL Server)") as demo:
         add_navbar(active="player")
 
-        # Cổng xác thực
+        # Gate bằng cookie (bỏ nếu không dùng auth)
         gate_msg = gr.Markdown("⛔ Chưa đăng nhập. Vui lòng vào **/login**.")
         app_group = gr.Group(visible=False)
 
         with app_group:
-            gr.Markdown("## 🎵 Trình phát nhạc theo thể loại (từ CSDL)")
-
-            # State giữ bảng hiện tại (để xử lý next/prev & click)
-            table_state = gr.State(value=[])
+            gr.Markdown("## 🎵 Trình phát nhạc (đọc từ SQL Server → phát theo đường dẫn)")
 
             with gr.Row():
                 genre_dd = gr.Dropdown(choices=[], label="Thể loại", interactive=True, scale=1)
-                search_box = gr.Textbox(label="Tìm bài/ca sĩ", placeholder="Nhập tên bài hoặc ca sĩ…", scale=2)
-                search_btn = gr.Button("🔎 Tìm", variant="secondary", scale=0)
-
-            # Bảng danh sách bài hát (ẩn cột filepath bằng cách để cuối, user không cần quan tâm)
-            tracks_table = gr.Dataframe(
-                headers=["ID", "Title", "Artist", "Genre", "Duration", "Filepath"],
-                datatype=["number", "str", "str", "str", "str", "str"],
-                row_count=(0, "dynamic"),
-                col_count=(6, "fixed"),
-                wrap=True,
-                interactive=False,
-                label="Danh sách bài hát (click một dòng để phát)"
-            )
+                refresh_btn = gr.Button("🔄 Refresh", variant="secondary", scale=0)
+                status_md = gr.Markdown("")
 
             with gr.Row():
-                prev_btn = gr.Button("⏮️ Trước", variant="secondary")
-                play_title = gr.Textbox(label="Đang phát", interactive=False)
-                next_btn = gr.Button("⏭️ Sau", variant="secondary")
+                song_dd = gr.Dropdown(choices=[], label="Danh sách bài (từ DB)", interactive=True, scale=2)
+                prev_btn = gr.Button("⏮️ Trước", scale=1)
+                next_btn = gr.Button("⏭️ Sau", scale=1)
 
+            now_playing = gr.Textbox(label="Đang chọn", interactive=False)
             player = gr.Audio(label="Trình phát", autoplay=True, interactive=False)
 
-            # --- Nạp genres + tracks ban đầu ---
+            # Load ban đầu
             demo.load(
-                fn=load_genres_and_tracks,
+                fn=load_initial,
                 inputs=None,
-                outputs=[genre_dd, tracks_table, play_title, player]
+                outputs=[genre_dd, song_dd, player, status_md]
+            ).then(
+                lambda name: name, [song_dd], [now_playing], show_progress=False
             )
-
-            # Đồng bộ state bảng khi nạp/đổi thể loại/tìm kiếm
-            def _sync_state(df):
-                return df
-            tracks_table.change(_sync_state, [tracks_table], [table_state], show_progress=False)
 
             # Đổi thể loại
             genre_dd.change(
                 fn=on_change_genre,
                 inputs=[genre_dd],
-                outputs=[tracks_table, play_title, player]
-            ).then(_sync_state, [tracks_table], [table_state], show_progress=False)
-
-            # Tìm kiếm
-            search_btn.click(
-                fn=on_search,
-                inputs=[search_box, genre_dd],
-                outputs=[tracks_table, play_title, player]
-            ).then(_sync_state, [tracks_table], [table_state], show_progress=False)
-
-            # Chọn 1 dòng để phát
-            tracks_table.select(
-                fn=on_select_row,
-                inputs=[tracks_table],
-                outputs=[play_title, player]
+                outputs=[song_dd, player]
+            ).then(
+                lambda name: name, [song_dd], [now_playing], show_progress=False
             )
 
-            # Next / Prev
+            # Refresh danh sách theo thể loại hiện tại
+            refresh_btn.click(
+                fn=on_refresh,
+                inputs=[genre_dd],
+                outputs=[song_dd, player]
+            ).then(
+                lambda name: name, [song_dd], [now_playing], show_progress=False
+            )
+
+            # Chọn bài
+            song_dd.change(
+                fn=on_select_song,
+                inputs=[song_dd, genre_dd],
+                outputs=[player]
+            ).then(
+                lambda name: name, [song_dd], [now_playing], show_progress=False
+            )
+
+            # Next/Prev
             next_btn.click(
-                fn=lambda t, df: next_prev(t, df, "next"),
-                inputs=[play_title, table_state],
-                outputs=[play_title, player]
+                fn=lambda cur, g: next_prev(cur, g, "next"),
+                inputs=[now_playing, genre_dd],
+                outputs=[song_dd, player]
+            ).then(
+                lambda name: name, [song_dd], [now_playing], show_progress=False
             )
+
             prev_btn.click(
-                fn=lambda t, df: next_prev(t, df, "prev"),
-                inputs=[play_title, table_state],
-                outputs=[play_title, player]
+                fn=lambda cur, g: next_prev(cur, g, "prev"),
+                inputs=[now_playing, genre_dd],
+                outputs=[song_dd, player]
+            ).then(
+                lambda name: name, [song_dd], [now_playing], show_progress=False
             )
 
-            gr.Markdown("> Mẹo: Click một dòng trong bảng để phát. Có thể lọc theo **Thể loại** hoặc dùng ô **Tìm kiếm**.")
+            gr.Markdown("> Chỉ **đọc DB** để lấy `filepath` và phát nhạc. Đảm bảo đường dẫn tồn tại trên máy server.")
 
-        # Kiểm tra cookie để mở khóa trang
+        # Auth gate
         def on_load(request: gr.Request):
             token = _read_token_from_cookie(request)
             user = verify_jwt(token) if token else None
