@@ -56,4 +56,4 @@ app = gr.mount_gradio_app(app, main_app,   path="/app")
 app = gr.mount_gradio_app(app, player_app, path="/player")
 
 if __name__ == "__main__":
-    uvicorn.run("run_server:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("run_server:app", host="0.0.0.0", port=8001, reload=True)
